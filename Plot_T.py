@@ -1,42 +1,24 @@
-"""
-===============================================================================
-All-India Cellular Network Tower Visualizer
-===============================================================================
-File        : Plot_T.py
-Datasets    : 404.csv, 405.csv
-Description : Processes nationwide OpenCellID data from MCC 404 and 405 CSV files,
-              maps India telecom operators (Airtel, Jio, Vi, BSNL) and radio 
-              technologies (GSM, LTE, 5G NR), rendering an interactive Folium map.
-===============================================================================
-"""
-
 import logging
 import sys
 from pathlib import Path
 import pandas as pd
 import folium
-from folium.plugins import FastMarkerCluster, MiniMap
+from folium.plugins import MarkerCluster, MiniMap
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION CONSTANTS
-# -----------------------------------------------------------------------------
 CSV_FILES = ["404_part1.csv", "404_part2.csv", "405_part1.csv", "405_part2.csv"]
 OUTPUT_HTML_MAP = "towers_filtered_map.html"
 
-# Keyless Dark Map Tile URL (Esri Dark Gray Canvas)
 DARK_TILE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
 DARK_TILE_ATTR = "Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ"
 
-# All-India Geographic Bounding Box
 LAT_MIN, LAT_MAX = 6.0, 37.5
 LON_MIN, LON_MAX = 68.0, 97.5
 
-
 INDIA_CENTER = [20.5937, 78.9629]
 INITIAL_ZOOM = 5
-MAX_MARKERS_PER_LAYER = 30_000  # Cap per layer for fast browser rendering
+# you can increase the marks per layer but it will increase the size of the HTML file 
+MAX_MARKERS_PER_LAYER = 10000
 
-# Mobile Network Code (MNC / 'mnc' / 'net') mapping for Indian Operators
 OPERATOR_MNC_MAP = {
     10: "Airtel", 45: "Airtel", 90: "Airtel", 98: "Airtel",
     5: "Vodafone Idea", 20: "Vodafone Idea", 22: "Vodafone Idea",
@@ -51,12 +33,7 @@ logging.basicConfig(
 )
 
 
-# -----------------------------------------------------------------------------
-# DATA PIPELINE
-# -----------------------------------------------------------------------------
 class TelecomDataPipeline:
-    """Loads, combines, cleans, and filters MCC datasets (404.csv, 405.csv)."""
-
     def __init__(self, filepaths: list[str]):
         self.filepaths = [Path(f) for f in filepaths]
 
@@ -72,11 +49,9 @@ class TelecomDataPipeline:
             df = pd.read_csv(path)
             df.columns = [col.lower().strip() for col in df.columns]
 
-            # Standardize longitude column name ('lon' vs 'long')
             if "lon" in df.columns and "long" not in df.columns:
                 df.rename(columns={"lon": "long"}, inplace=True)
 
-            # Standardize MNC column name ('net' vs 'mnc')
             if "net" in df.columns and "mnc" not in df.columns:
                 df.rename(columns={"net": "mnc"}, inplace=True)
 
@@ -86,27 +61,27 @@ class TelecomDataPipeline:
             logging.error("No valid CSV files were loaded.")
             raise FileNotFoundError("None of the specified CSV files were found.")
 
-        # Combine all loaded CSVs
         combined_df = pd.concat(dataframes, ignore_index=True)
 
-        # Cast coordinates and drop missing rows
         combined_df["lat"] = pd.to_numeric(combined_df["lat"], errors="coerce")
         combined_df["long"] = pd.to_numeric(combined_df["long"], errors="coerce")
         combined_df.dropna(subset=["lat", "long"], inplace=True)
 
-        # Bounding Box Filter for India Geographic Boundaries
         combined_df = combined_df[
             (combined_df["lat"].between(LAT_MIN, LAT_MAX)) & 
             (combined_df["long"].between(LON_MIN, LON_MAX))
         ]
 
-        # Radio Technology Cleaning
         if "radio" in combined_df.columns:
             combined_df["radio"] = combined_df["radio"].astype(str).str.upper().str.strip()
         else:
             combined_df["radio"] = "GSM"
 
-        # Map MNC ('net' / 'mnc') to Operator Name
+        if "range" in combined_df.columns:
+            combined_df["range"] = pd.to_numeric(combined_df["range"], errors="coerce").fillna(1000).astype(int)
+        else:
+            combined_df["range"] = 1000
+
         if "mnc" in combined_df.columns:
             combined_df["mnc"] = pd.to_numeric(combined_df["mnc"], errors="coerce")
             combined_df["operator"] = combined_df["mnc"].map(OPERATOR_MNC_MAP).fillna("Other / Regional")
@@ -117,12 +92,7 @@ class TelecomDataPipeline:
         return combined_df
 
 
-# -----------------------------------------------------------------------------
-# GEOSPATIAL MAP RENDERER
-# -----------------------------------------------------------------------------
 class IndiaTowerMapBuilder:
-    """Renders interactive Folium map with independent Operator and Technology layer controls."""
-
     def __init__(self, data: pd.DataFrame):
         self.df = data
 
@@ -137,52 +107,37 @@ class IndiaTowerMapBuilder:
             prefer_canvas=True
         )
 
-        # ---------------------------------------------------------------------
-        # 1. OPERATOR FEATURE GROUPS
-        # ---------------------------------------------------------------------
         operators = self.df["operator"].unique() if not self.df.empty else []
-        
+
         for operator in operators:
             op_df = self.df[self.df["operator"] == operator]
             if len(op_df) > MAX_MARKERS_PER_LAYER:
                 op_df = op_df.sample(MAX_MARKERS_PER_LAYER, random_state=42)
 
             op_group = folium.FeatureGroup(name=f"🏢 Operator: {operator} ({len(op_df):,})")
-            coords = op_df[["lat", "long"]].values.tolist()
+            cluster = MarkerCluster(disableClusteringAtZoom=14).add_to(op_group)
 
-            FastMarkerCluster(
-                data=coords,
-                disableClusteringAtZoom=14
-            ).add_to(op_group)
+            for row in op_df.itertuples(index=False):
+                popup_html = f"""
+                <div style="font-family: Arial, sans-serif; width: 190px;">
+                    <h4 style="margin: 0 0 5px 0; color: #0078A8;"><b>{row.operator}</b></h4>
+                    <hr style="margin: 5px 0;">
+                    <b>Radio:</b> {getattr(row, 'radio', 'N/A')}<br>
+                    <b>Latitude:</b> {row.lat:.5f}<br>
+                    <b>Longitude:</b> {row.long:.5f}<br>
+                    <b>Range:</b> {getattr(row, 'range', 1000):,} meters
+                </div>
+                """
+                folium.Marker(
+                    location=[row.lat, row.long],
+                    popup=folium.Popup(popup_html, max_width=220),
+                    tooltip=f"{row.operator} ({getattr(row, 'radio', 'Cell Tower')})"
+                ).add_to(cluster)
 
             op_group.add_to(map_canvas)
 
-        # ---------------------------------------------------------------------
-        # 2. TECHNOLOGY FEATURE GROUPS
-        # ---------------------------------------------------------------------
-        technologies = self.df["radio"].unique() if not self.df.empty else []
-
-        for tech in technologies:
-            tech_df = self.df[self.df["radio"] == tech]
-            if len(tech_df) > MAX_MARKERS_PER_LAYER:
-                tech_df = tech_df.sample(MAX_MARKERS_PER_LAYER, random_state=42)
-
-            tech_group = folium.FeatureGroup(
-                name=f"📡 Tech: {tech} ({len(tech_df):,})", 
-                show=False
-            )
-            coords = tech_df[["lat", "long"]].values.tolist()
-
-            FastMarkerCluster(
-                data=coords,
-                disableClusteringAtZoom=14
-            ).add_to(tech_group)
-
-            tech_group.add_to(map_canvas)
-
-        # UI Additions
         folium.LayerControl(collapsed=False).add_to(map_canvas)
-        
+
         minimap_layer = folium.TileLayer(
             tiles=DARK_TILE_URL,
             attr=DARK_TILE_ATTR,
@@ -197,9 +152,6 @@ class IndiaTowerMapBuilder:
         logging.info("Interactive map saved to: %s", output_path)
 
 
-# -----------------------------------------------------------------------------
-# MAIN EXECUTION ENTRYPOINT
-# -----------------------------------------------------------------------------
 def main():
     try:
         pipeline = TelecomDataPipeline(CSV_FILES)
